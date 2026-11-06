@@ -22,10 +22,11 @@ export interface TranscriptMeta {
   /** Output of `<command> --version`, replayed for drivers that probe it. */
   version?: string;
   recordedAt: string;
+  source?: string;
 }
 
 export interface TranscriptFrame {
-  dir: "in" | "out";
+  dir: "in" | "out" | "signal";
   /** Milliseconds since the provider process started. */
   ms: number;
   frame: unknown;

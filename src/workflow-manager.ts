@@ -22,6 +22,11 @@ import {
   type WorkflowAgentOptions, type WorkflowCall, type WorkflowEvent, type WorkflowRun, type WorkflowRunInput, type WorkflowSnapshot,
 } from "./workflow-types.js";
 import { createWorkflowWorkspace, isManagedWorkflowWorkspace } from "./workflow-workspaces.js";
+import { chooseTestingTarget, parseCoordinationTask } from "./testing-coordination.js";
+import { parseTestingRun } from "./workflow-testing.js";
+import { testingGit } from "./workflow-evidence.js";
+import { builtinTestingSource, WorkflowTestingSession } from "./workflow-testing-session.js";
+import { localAgentProviderAvailability } from "./local-agent-availability.js";
 
 interface WorkflowManagerOptions {
   store: WorkflowStore;
@@ -49,6 +54,8 @@ interface ActiveRun {
   previous: WorkflowCall[];
   replayPrefix: boolean;
   unconfirmedStops: boolean;
+  testing?: WorkflowTestingSession;
+  deadline?: number;
 }
 
 /** Owns execution; host-authored JavaScript owns the workflow decisions. */
@@ -66,8 +73,8 @@ export class WorkflowManager {
     if (this.active.size >= 8) throw new WorkflowError("WORKFLOW_CAPACITY", "Eight workflows are already active. Wait for one to finish.", true);
     const scope = await this.authorize(input);
 
-    if ([input.source !== undefined, input.name !== undefined, input.resume !== undefined].filter(Boolean).length !== 1) {
-      throw new WorkflowError("INVALID_WORKFLOW", "Supply exactly one source, name, or resume ID.");
+    if ([input.source !== undefined, input.name !== undefined, input.resume !== undefined, input.builtin !== undefined].filter(Boolean).length !== 1) {
+      throw new WorkflowError("INVALID_WORKFLOW", "Supply exactly one source, name, builtin, or resume ID.");
     }
 
     const previous = input.resume ? this.snapshot(input.resume, scope) : undefined;
@@ -75,6 +82,8 @@ export class WorkflowManager {
     if (previous && (!workflowTerminal(previous.status) || this.active.has(previous.id))) {
       throw new WorkflowError("WORKFLOW_ACTIVE", "Cancel and wait for the previous run before resuming.");
     }
+
+    if (previous?.builtin) throw new WorkflowError("RECOVERY_REQUIRED", "Testing runs are never replayed. Inspect preserved worktrees and evidence before starting a new explicit run.");
 
     const previousCalls = previous ? this.options.store.calls(previous.id) : [];
 
@@ -98,7 +107,8 @@ export class WorkflowManager {
       throw new WorkflowError("INVALID_WORKFLOW", "Resume uses the original arguments and authority. Start a new run to change them.");
     }
 
-    const source = previous?.source ?? input.source ?? await this.namedSource(input.name!, scope.workspaceRoot);
+    if (input.builtin && input.builtin !== "testing-coordination") throw new WorkflowError("INVALID_WORKFLOW", "Unknown builtin workflow.");
+    const source = previous?.source ?? input.source ?? (input.builtin ? await builtinTestingSource() : await this.namedSource(input.name!, scope.workspaceRoot));
 
     if (!isJsonString(source) || Buffer.byteLength(source) > 65_536) throw new WorkflowError("SOURCE_LIMIT", "Workflow source exceeds 64 KiB.");
     let meta: ReturnType<typeof parseWorkflowScript>["meta"];
@@ -106,7 +116,20 @@ export class WorkflowManager {
     try { meta = parseWorkflowScript(source).meta; }
     catch (error) { throw new WorkflowError("INVALID_WORKFLOW", workflowFailure(error).message); }
 
-    const args = jsonValue(previous ? previous.args : input.args ?? {}, 131_072, "arguments");
+    const testing = input.builtin ? parseTestingRun(input.args) : undefined;
+    let baseSha: string | undefined;
+
+    if (testing) {
+      if (!this.options.config) throw new WorkflowError("INVALID_WORKSPACE", "Testing coordination requires managed worktrees.");
+
+      if (!testing.baseRef && (await testingGit(scope.workspaceRoot, ["status", "--porcelain", "--untracked-files=normal"])).trim()) {
+        throw new WorkflowError("TESTING_BASELINE_REQUIRED", "Source has uncommitted inputs. Have the host confirm a committed baseRef explicitly; no changes will be committed or silently included.");
+      }
+
+      baseSha = (await testingGit(scope.workspaceRoot, ["rev-parse", "--verify", "--end-of-options", `${testing.baseRef ?? "HEAD"}^{commit}`])).trim();
+    }
+
+    const args = jsonValue(testing ?? (previous ? previous.args : input.args ?? {}), 131_072, "arguments");
     const contextHash = await workflowContextHash(scope.workspaceRoot);
 
     if (previous && (!contextHash || contextHash !== previous.contextHash)) {
@@ -122,6 +145,7 @@ export class WorkflowManager {
       id: `wf_${randomUUID()}`, ...scope, name: meta.name, source, args, contextHash: contextHash ?? "unavailable",
       writeMode, concurrency: meta.concurrency, status: "starting", resumeOf: previous?.id,
       createdAt: now, updatedAt: now, callCount: 0,
+      ...optionalFields(input.builtin ? { builtin: input.builtin, baseSha } : undefined),
     };
 
     if (this.active.size >= 8) throw new WorkflowError("WORKFLOW_CAPACITY", "Eight workflows are already active. Wait for one to finish.", true);
@@ -134,6 +158,11 @@ export class WorkflowManager {
       done: Promise.resolve(),
     };
 
+    if (testing) active.deadline = Date.now() + testing.timeoutMs;
+
+    if (testing) active.testing = new WorkflowTestingSession(testing, baseSha!, join(this.options.config!.stateDir, "workflow-evidence", run.id),
+      (workspace) => this.callWorkspace(active, { target: testing.planner, workspace, isolation: "worktree" }, -1),
+      (type, data) => this.options.store.event(run.id, type, data));
     this.active.set(run.id, active);
     active.done = this.execute(active);
     // Completion failures remain visible in persisted state; never create an unhandled rejection.
@@ -226,15 +255,21 @@ export class WorkflowManager {
     let result: JsonValue | undefined;
     let failure: WireInput | undefined;
 
+    const timer = active.testing ? setTimeout(() => controller.abort(new WorkflowError("WORKFLOW_TIMEOUT", "Testing coordination exhausted its wall-clock budget.")), active.testing.config.timeoutMs) : undefined;
+
     try {
       this.options.store.update(run.id, { status: "running" });
       result = await this.script(active, run.source, run.args, 0);
+
+      this.checkBudget(active);
+      await active.testing?.finish(result);
 
       if (active.pending.size) throw new WorkflowError("UNAWAITED_CALLS", "Workflow returned while agent calls were still pending. Await all calls before returning.");
 
       if (controller.signal.aborted) throw controller.signal.reason;
     } catch (error) { failure = error; }
     finally {
+      if (timer) clearTimeout(timer);
       // One finalization path: stop admission first, then confirm every owned turn has settled.
       controller.abort(failure ?? new WorkflowError("WORKFLOW_FINISHED", "Workflow finished."));
 
@@ -262,6 +297,17 @@ export class WorkflowManager {
 
     try { return await runner({
       source, args, signal: active.controller.signal, depth,
+      ...optionalFields(active.testing ? { limits: { timeoutMs: active.testing.config.timeoutMs } } : undefined),
+      onInspect: (value) => this.testingOperation(active, () => {
+        if (!active.testing) throw new WorkflowError("WORKFLOW_CAPABILITY_UNAVAILABLE", "Inspection requires a builtin testing contract.");
+
+        return active.testing.inspect(value);
+      }),
+      onVerify: (value) => this.testingOperation(active, () => {
+        if (!active.testing || active.run.writeMode !== "allowed") throw new WorkflowError("WORKFLOW_AUTHORITY", "Verification requires a builtin testing contract and allowed write mode.");
+
+        return active.testing.verify(value, active.controller.signal);
+      }),
       onAgent: (prompt, options) => {
         // SAFETY: The surrounding checks or construction already match this type.
         const task = this.agent(active, prompt, options as WorkflowAgentOptions, workflowHash(source));
@@ -301,6 +347,7 @@ export class WorkflowManager {
   }
   private async agent(active: ActiveRun, prompt: string, value: WorkflowAgentOptions, sourceHash: string): Promise<JsonValue> {
     const signal = active.controller.signal;
+    this.checkBudget(active);
     signal.throwIfAborted();
     const index = active.calls++;
 
@@ -315,9 +362,32 @@ export class WorkflowManager {
       const validate = options.schema ? compileWorkflowSchema(options.schema) : undefined;
       const scope = await this.callWorkspace(active, options, index);
       const profiles = await this.options.loadProfiles(scope.workspaceRoot);
-      const target = resolveLocalAgentTarget(options.target, profiles, options.model, options.effort, this.options.subagents.providers);
 
-      if (!target) throw new WorkflowError("UNKNOWN_TARGET", `Unknown agent target: ${options.target}`);
+      const routing = options.coordination
+        ? chooseTestingTarget({
+          requestedTarget: options.target, task: options.coordination, providers: this.options.subagents.providers,
+          available: (provider) => localAgentProviderAvailability(provider.id, process.env, this.options.subagents).available,
+        })
+        : { target: options.target, reason: "explicit" as const };
+
+      const target = resolveLocalAgentTarget(routing.target, profiles, options.model, options.effort, this.options.subagents.providers);
+
+      if (!target) throw new WorkflowError("UNKNOWN_TARGET", `Unknown agent target: ${routing.target}`);
+
+      if (active.testing && options.coordination?.kind !== "implementation"
+        && this.options.subagents.providers.find((entry) => entry.id === target.provider)?.driver !== "codex") {
+        throw new WorkflowError("INVALID_TESTING_TARGET", "Testing analysis, diagnosis and review require a Codex provider or explicit Codex profile.");
+      }
+
+      if (options.target === "auto" && target.kind === "profile") {
+        throw new WorkflowError("AMBIGUOUS_TARGET", `Automatic provider target ${routing.target} is shadowed by a profile. Select the profile explicitly or configure a distinct provider instance id.`);
+      }
+
+      if (options.coordination && options.target === "auto") {
+        this.options.store.event(active.run.id, "routing_decision", { index, requestedTarget: options.target, ...routing });
+      }
+
+      options.target = routing.target;
       options.model = target.model;
       options.effort = target.effort;
 
@@ -342,6 +412,16 @@ export class WorkflowManager {
 
       this.options.store.addCall(call);
 
+      if (active.testing) this.options.store.event(active.run.id, "testing_task_contract", {
+        taskId: `${active.testing.config.taskId}:${index}`, phase: options.phase, kind: options.coordination?.kind,
+        dependsOn: index ? [`${active.testing.config.taskId}:${index - 1}`] : [],
+        inputs: active.testing.config.inputs, allowedPaths: active.testing.config.allowedPaths,
+        artifacts: active.testing.config.artifacts, acceptance: active.testing.config.acceptance,
+        verificationIds: active.testing.config.checks.map((check) => check.id),
+        failureOwner: active.testing.config.failureOwner, repairBudget: active.testing.config.maxRepairs,
+        baseSha: active.run.baseSha, ...scope,
+      });
+
       return { call, validate, reuse };
     });
 
@@ -351,11 +431,13 @@ export class WorkflowManager {
     if (reuse) return call.result ?? null;
     let releaseRun: (() => void) | undefined;
     let releaseGlobal: (() => void) | undefined;
+    let finishTesting: (() => Promise<void>) | undefined;
 
     try {
       releaseRun = await active.slots.acquire(signal);
       releaseGlobal = await this.slots.acquire(signal);
       signal.throwIfAborted();
+      finishTesting = await active.testing?.beginAgent(call.options);
       this.countDispatch(active);
       const fullPrompt = validate ? `${prompt}\n\nReturn only JSON matching this schema:\n${JSON.stringify(call.options.schema)}` : prompt;
       const started = await this.options.agents.start({ ...call, ...call.options, prompt: fullPrompt, agentId: call.agentId });
@@ -375,6 +457,9 @@ export class WorkflowManager {
       if (validate) {
         try { output = parseWorkflowOutput(response, validate); }
         catch (error) {
+          if (finishTesting) { const finish = finishTesting; finishTesting = undefined; await finish(); }
+
+          finishTesting = await active.testing?.beginAgent({ ...call.options, writeMode: "read_only", coordination: undefined });
           // Repair only formatting, in the same session with authority reduced to read-only.
           signal.throwIfAborted();
           this.countDispatch(active);
@@ -398,17 +483,28 @@ export class WorkflowManager {
         }
       }
 
+      if (finishTesting) { const finish = finishTesting; finishTesting = undefined; await finish(); }
+
+      await active.testing?.acceptAgent(call.options, output);
       output = jsonValue(output, 262_144, "agent result");
       this.options.store.updateCall(call.runId, index, { status: "completed", result: output });
 
       return output;
     } catch (error) {
+      let failure = error;
       // Resolve ownership again if cancellation raced dispatch or the turn-link write.
       await this.stopOwnedCall(active, call);
-      this.options.store.updateCall(call.runId, index, { status: signal.aborted ? "cancelled" : "failed", error: workflowFailure(error) });
 
-      if (workflowFailure(error).code === "WORKFLOW_INTERNAL" || workflowFailure(error).code.includes("LIMIT")) this.fatal(active, error);
-      throw error;
+      if (finishTesting) {
+        const finish = finishTesting; finishTesting = undefined;
+
+        try { await finish(); } catch (inspectionError) { failure = new WorkflowError("TESTING_SCOPE", `${workflowFailure(failure).message}\nPost-call inspection: ${workflowFailure(inspectionError).message}`); }
+      }
+
+      this.options.store.updateCall(call.runId, index, { status: signal.aborted ? "cancelled" : "failed", error: workflowFailure(failure) });
+
+      if (workflowFailure(failure).code.includes("INTERNAL") || workflowFailure(failure).code.includes("LIMIT")) this.fatal(active, failure);
+      throw failure;
     } finally { releaseGlobal?.(); releaseRun?.(); }
   }
   private async awaitTurn(active: ActiveRun, call: WorkflowCall, turnId: string): Promise<string> {
@@ -481,8 +577,14 @@ export class WorkflowManager {
   private fatal(active: ActiveRun, error: WireInput): WireInput { active.controller.abort(error);
 
  return error; }
+  private checkBudget(active: ActiveRun): void {
+    if (active.deadline !== undefined && Date.now() >= active.deadline) throw this.fatal(active, new WorkflowError("WORKFLOW_TIMEOUT", "Testing coordination exhausted its wall-clock budget."));
+  }
   private countDispatch(active: ActiveRun): void {
-    if (++active.dispatches > 128) throw this.fatal(active, new WorkflowError("WORKFLOW_CALL_LIMIT", "Workflow exceeds 128 agent turns, including schema repairs."));
+    this.checkBudget(active);
+    const limit = active.testing?.config.maxCalls ?? 128;
+
+    if (++active.dispatches > limit) throw this.fatal(active, new WorkflowError("WORKFLOW_CALL_LIMIT", `Workflow exceeds ${limit} agent turns, including schema repairs.`));
   }
   private snapshot(id: string, scope: LocalAgentWorkspaceScope): WorkflowSnapshot {
     const run = this.options.store.get(id);
@@ -531,6 +633,15 @@ export class WorkflowManager {
       throw new WorkflowError("INVALID_WORKFLOW", `Cannot read workflow ${name}: ${workflowFailure(error).message}`);
     }
   }
+  private testingOperation(active: ActiveRun, operation: () => Promise<JsonValue>): Promise<JsonValue> {
+    this.checkBudget(active);
+    active.controller.signal.throwIfAborted();
+    const task = operation();
+    active.pending.add(task);
+    void task.then(() => active.pending.delete(task), () => active.pending.delete(task));
+
+    return task;
+  }
   private async callWorkspace(active: ActiveRun, options: WorkflowAgentOptions, index: number): Promise<LocalAgentWorkspaceScope> {
     if (!options.workspace && !options.isolation) return { workspaceRoot: active.run.workspaceRoot, workspaceId: active.run.workspaceId };
     const key = options.workspace ?? `@call:${index}`;
@@ -540,7 +651,7 @@ export class WorkflowManager {
       if (!options.isolation) throw new WorkflowError("INVALID_WORKSPACE", `Unknown workflow workspace: ${key}. Create it with isolation: 'worktree'.`);
 
       if (!this.options.config) throw new WorkflowError("INVALID_WORKSPACE", "Managed worktrees are unavailable.");
-      workspace = createWorkflowWorkspace(this.options.config, active.run);
+      workspace = createWorkflowWorkspace(this.options.config, active.run, active.run.baseSha);
       active.workspaces.set(key, workspace);
       const scope = await workspace;
       this.options.store.event(active.run.id, "workspace_created", { key, ...scope, retained: true });
@@ -570,11 +681,18 @@ function agentOptions(value: WorkflowAgentOptions, authority: "read_only" | "all
   if (!value || !isObjectValue(value) || Array.isArray(value)) throw new WorkflowError("INVALID_AGENT_CALL", "Agent options must be an object.");
   // SAFETY: The surrounding checks or construction already match this type.
   const options = unsafeNarrow<WorkflowAgentOptions>(jsonValue(value, 32_768, "agent options"));
-  const keys = new Set(["target", "model", "effort", "schema", "label", "phase", "writeMode", "isolation", "workspace"]);
+  const keys = new Set(["target", "model", "effort", "schema", "label", "phase", "writeMode", "isolation", "workspace", "coordination"]);
 
   for (const key of Object.keys(options)) if (!keys.has(key)) throw new WorkflowError("INVALID_AGENT_CALL", `Unknown agent option: ${key}`);
 
   if (!isJsonString(options.target) || !options.target.trim()) throw new WorkflowError("INVALID_AGENT_CALL", "Agent target is required.");
+
+  if (options.coordination !== undefined) {
+    try { options.coordination = parseCoordinationTask(options.coordination); }
+    catch { throw new WorkflowError("INVALID_AGENT_CALL", "Invalid coordination task metadata."); }
+
+    if (options.target === "auto" && options.coordination.routing === "explicit") throw new WorkflowError("INVALID_AGENT_CALL", "Explicit coordination routing requires a concrete target, not auto.");
+  }
 
   for (const key of ["model", "effort", "label", "phase", "workspace"] as const) {
     if (options[key] !== undefined && (!isJsonString(options[key]) || options[key]!.length > 256 || !options[key]!.trim())) throw new WorkflowError("INVALID_AGENT_CALL", `Invalid agent ${key}.`);

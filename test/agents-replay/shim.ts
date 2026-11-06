@@ -84,14 +84,17 @@ function record(path: string): void {
   createInterface({ input: child.stdout }).on("line", (line) => appendLine("out", line));
 
   for (const signal of ["SIGTERM", "SIGINT"] as const) {
-    process.on(signal, () => child.kill(signal));
+    process.on(signal, () => {
+      append("signal", { signal });
+      child.kill(signal);
+    });
   }
 
   child.on("exit", (code, signal) => process.exit(code ?? (signal ? 128 : 1)));
 }
 
 /** Writes the meta line and returns an appender that redacts and scrubs each frame. */
-function startTranscript(path: string, command: string): (dir: "in" | "out", frame: WireInput) => void {
+function startTranscript(path: string, command: string): (dir: "in" | "out" | "signal", frame: WireInput) => void {
   mkdirSync(dirname(path), { recursive: true });
   const startedAt = Date.now();
   const version = spawnSync(command, ["--version"], { encoding: "utf8", timeout: 10_000 }).stdout?.trim();
@@ -106,6 +109,7 @@ function startTranscript(path: string, command: string): (dir: "in" | "out", fra
     cwd: scrub(process.cwd(), context) as string,
     ...optionalFields(version ? { version } : undefined),
     recordedAt: new Date().toISOString(),
+    ...optionalFields(env.DEVSPACE_QA_RECORDING_SOURCE ? { source: env.DEVSPACE_QA_RECORDING_SOURCE } : undefined),
   };
 
   writeFileSync(path, `${JSON.stringify(meta)}\n`);
@@ -226,7 +230,7 @@ function findWorktree(root: string | undefined): string | undefined {
 
 /** Temporary directories (Pi's sandbox extension) and server ports differ every run. */
 function normalizeArgs(values: string[]): string[] {
-  return values.map((value) => value.replace(/\$TMP\/[^/\s"]+/g, "$TMP/*").replace(/^--port=\d+$/, "--port=*"));
+  return values.map((value) => (provider.id === "dsh" ? value.replaceAll("\\", "/") : value).replace(/\$TMP\/[^/\s"]+/g, "$TMP/*").replace(/^--port=\d+$/, "--port=*"));
 }
 
 function isRecord(value: WireInput): value is JsonObject {

@@ -32,9 +32,9 @@ export function isManagedWorkflowWorkspace(config: AgentConfig, root: string, id
   finally { store.close(); }
 }
 
-export async function createWorkflowWorkspace(config: AgentConfig, source: LocalAgentWorkspaceScope): Promise<LocalAgentWorkspaceScope> {
+export async function createWorkflowWorkspace(config: AgentConfig, source: LocalAgentWorkspaceScope, requestedRef?: string): Promise<LocalAgentWorkspaceScope> {
   let sourcePath = source.workspaceRoot;
-  let baseRef: string | undefined;
+  let baseRef: string | undefined = requestedRef;
 
   if (source.workspaceId && isManagedWorkflowWorkspace(config, sourcePath, source.workspaceId)) {
     const store = new SqliteWorkspaceStore(config.stateDir);
@@ -48,7 +48,7 @@ export async function createWorkflowWorkspace(config: AgentConfig, source: Local
     finally { store.close(); }
 
     const head = await promisify(execFile)("git", ["rev-parse", "HEAD"], { cwd: source.workspaceRoot, timeout: 5_000 });
-    baseRef = head.stdout.trim();
+    baseRef ??= head.stdout.trim();
   }
 
   await resolveCanonicalAllowedPath(sourcePath, sourcePath, config.allowedRoots);

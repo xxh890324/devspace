@@ -200,6 +200,17 @@ test("provider errors keep their code and retryability", async () => {
   );
 });
 
+test("provider protocol failures can be handed back without hiding workflow protocol failures", async () => {
+  assert.deepEqual(await runWorkflowScript({
+    source: `try { await agent('implement',{target:'worker'}); } catch (error) { return {code:error.code,nextOwner:'codex'}; }`,
+    onAgent: () => { throw new WorkflowError("PROVIDER_PROTOCOL_ERROR", "unsupported SDK permission command"); },
+  }), { code: "PROVIDER_PROTOCOL_ERROR", nextOwner: "codex" });
+  await assert.rejects(runWorkflowScript({
+    source: `try { await agent('implement',{target:'worker'}); } catch { return 'must not recover'; }`,
+    onAgent: () => { throw new WorkflowError("WORKFLOW_PROTOCOL_ERROR", "invalid workflow transport frame"); },
+  }), (error) => error instanceof WorkflowError && error.code === "WORKFLOW_PROTOCOL_ERROR");
+});
+
 test("unawaited agent calls fail the run", async () => {
   let finishDetached!: () => void;
   const detachedCall = new Promise<void>((resolve) => { finishDetached = resolve; });

@@ -6,7 +6,12 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["./**/*.ts"]
+  "include": [
+    "./**/*.ts",
+    "../testing-coordination-*.ts"
+  ]
 }

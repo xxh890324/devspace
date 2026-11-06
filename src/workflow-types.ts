@@ -1,6 +1,7 @@
 import { isJsonString } from "./json-value.js";
 import type { JsonObject, JsonValue, WireInput } from "./json-value.js";
 import type { LocalAgentWorkspaceScope } from "./local-agent-store.js";
+import type { CoordinationTask } from "./testing-coordination.js";
 
 export type WorkflowStatus = "starting" | "running" | "stopping" | "completed" | "failed" | "cancelled" | "interrupted";
 
@@ -18,6 +19,7 @@ export class WorkflowError extends Error {
 export interface WorkflowRunInput extends LocalAgentWorkspaceScope {
   source?: string;
   name?: string;
+  builtin?: "testing-coordination";
   args?: unknown;
   resume?: string;
   writeMode?: WorkflowWriteMode;
@@ -30,6 +32,8 @@ export interface WorkflowRun extends LocalAgentWorkspaceScope {
   writeMode: WorkflowWriteMode;
   concurrency: number;
   resumeOf?: string;
+  builtin?: "testing-coordination";
+  baseSha?: string;
   result?: JsonValue;
   error?: WorkflowFailure;
   createdAt: string;
@@ -54,6 +58,8 @@ export interface WorkflowAgentOptions {
   isolation?: "worktree";
   /** A logical name, shared by calls in this run; never a filesystem path. */
   workspace?: string;
+  /** Optional host-authored routing metadata. `target: "auto"` uses it. */
+  coordination?: CoordinationTask;
 }
 
 export interface WorkflowCall {

@@ -92,6 +92,9 @@ function checkLocalAgentProviderAvailability(
             : "ACP command is not configured",
       };
     }
+
+    case "dsh":
+      return commandAvailability(providerInstanceId, providerEnv.DSH_COMMAND ?? "dsh", providerEnv);
   }
 }
 

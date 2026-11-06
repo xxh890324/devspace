@@ -178,3 +178,13 @@ test("help hides workflow commands without the experimental flag", async () => {
 
   assert.doesNotMatch(hiddenHelp.stdout, /workflow/);
 });
+
+test("builtin workflow selection reaches the daemon and is mutually exclusive with existing entrypoints", async () => {
+  const mark = requests.length;
+  const cliEnv = { ...process.env, ...env, DEVSPACE_EXPERIMENTAL_WORKFLOWS: "1", DEVSPACE_WORKSPACE_ID: "ws_test", DEVSPACE_WORKSPACE_ROOT: workspaceRoot };
+  await execFileAsync("node", ["--import", "tsx", "src/cli.ts", "workflow", "run", "--builtin", "testing-coordination", "--args", '{"task":"test"}', "--write-mode", "allowed", "--json"], { cwd: process.cwd(), env: cliEnv });
+  const submitted = requests.slice(mark).find((request) => request.method === "workflow.run");
+  assert.equal(submitted?.params.builtin, "testing-coordination");
+  assert.equal(submitted?.params.writeMode, "allowed");
+  await assert.rejects(execFileAsync("node", ["--import", "tsx", "src/cli.ts", "workflow", "run", "--builtin", "testing-coordination", "--name", "other", "--json"], { cwd: process.cwd(), env: cliEnv }), { code: 1, stdout: /Exactly one/ });
+});

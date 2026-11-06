@@ -33,12 +33,13 @@ export interface SkillReadResolution {
 
 const SUBAGENTS_SKILL_NAME = "subagents";
 const WORKFLOWS_SKILL_NAME = "workflows";
+const TESTING_COORDINATION_SKILL_NAME = "testing-coordination";
 
-type ManagedSkillName = typeof SUBAGENTS_SKILL_NAME | typeof WORKFLOWS_SKILL_NAME;
+type ManagedSkillName = typeof SUBAGENTS_SKILL_NAME | typeof WORKFLOWS_SKILL_NAME | typeof TESTING_COORDINATION_SKILL_NAME;
 
 // The workflows skill is part of the hidden DEVSPACE_EXPERIMENTAL_WORKFLOWS feature.
 function managedSkillNames(): ManagedSkillName[] {
-  return workflowsEnabled() ? [SUBAGENTS_SKILL_NAME, WORKFLOWS_SKILL_NAME] : [SUBAGENTS_SKILL_NAME];
+  return workflowsEnabled() ? [SUBAGENTS_SKILL_NAME, WORKFLOWS_SKILL_NAME, TESTING_COORDINATION_SKILL_NAME] : [SUBAGENTS_SKILL_NAME];
 }
 
 function bundledSkillsDir(): string {
@@ -153,14 +154,14 @@ function withoutManagedSkills(
   result: LoadSkillsResult,
   managedNames: readonly ManagedSkillName[],
 ): LoadedSkills {
-  // A managed workflows copy left behind while the feature was on must not be advertised once it is off.
-  const staleWorkflows = join(config.devspaceSkillsDir, WORKFLOWS_SKILL_NAME);
+  // Managed workflow skills left behind while the feature was on stay hidden once it is off.
+  const workflowSkillDirs = [WORKFLOWS_SKILL_NAME, TESTING_COORDINATION_SKILL_NAME].map((name) => join(config.devspaceSkillsDir, name));
 
   return {
     skills: result.skills.filter((skill) => (
       // SAFETY: The surrounding checks or construction already match this type.
       !managedNames.includes(skill.name as ManagedSkillName)
-      && !(skill.name === WORKFLOWS_SKILL_NAME && isPathInsideRoot(skill.filePath, staleWorkflows))
+      && !workflowSkillDirs.some((dir) => isPathInsideRoot(skill.filePath, dir))
     )),
     diagnostics: result.diagnostics.filter((diagnostic) => {
       const collision = diagnostic.collision;

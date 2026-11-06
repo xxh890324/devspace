@@ -122,6 +122,15 @@ devspace agents wait <id> <id>
 - **Dynamic workflows** (experimental, `DEVSPACE_EXPERIMENTAL_WORKFLOWS=1`) let
   the orchestrator write a small, resumable script with `agent()`,
   `parallel()`, `pipeline()`, and `phase()` instead of prompting step by step.
+- **Testing coordination** (experimental) keeps analysis and acceptance on Codex
+  and routes explicit, low uncertainty test implementation to an opted-in
+  DeepSeek Harness SDK provider. See the [provider setup and boundaries](skills/testing-coordination/SKILL.md)
+  and [plan → implementation → independent verification → review workflow](skills/testing-coordination/workflow.md).
+  Install explicitly with `devspace agents skill --skill testing-coordination --install codex --project`,
+  then run `devspace workflow run --builtin testing-coordination --args-file <contract.json> --write-mode allowed`.
+  The builtin pins a committed worktree baseline, validates handoffs and allowed paths, executes only host-declared
+  verification IDs, and binds read-only acceptance to current files and report hashes. Repairs are capped at two;
+  Shadow comparisons require explicit activation and never change configuration.
 
 ## Use It from ChatGPT, Claude, and Other MCP Hosts
 

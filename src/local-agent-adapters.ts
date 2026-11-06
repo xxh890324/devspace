@@ -31,6 +31,7 @@ import {
   type PiRpcFactory,
 } from "./local-agent-pi.js";
 import type { LocalAgentDriver } from "./local-agent-runtime.js";
+import { DshLocalAgentDriver } from "./local-agent-dsh.js";
 import { LocalAgentProviderRegistry } from "./local-agent-provider-registry.js";
 
 export type LocalAgentAdapter = LocalAgentDriver;
@@ -67,6 +68,11 @@ export function createLocalAgentProviderRegistry(
     .register("claude", ({ env, envOverrides }) => new ClaudeLocalAgentDriver(options.claudeQueryFactory, env, envOverrides))
     .register("opencode", ({ env }) => new OpencodeLocalAgentDriver({ factory: options.opencodeFactory, env }))
     .register("pi", ({ env }) => new PiLocalAgentDriver(options.piRpcFactory, env))
+    .register("dsh", ({ env, instance }) => new DshLocalAgentDriver({
+      env,
+      profile: instance.config && "profile" in instance.config ? instance.config.profile : "sdk",
+      command: instance.command,
+    }))
     .register("acp", ({ instance, env }) => new AcpLocalAgentDriver({
       env,
       command: instance.command,

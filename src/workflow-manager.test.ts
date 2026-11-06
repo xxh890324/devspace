@@ -4,9 +4,10 @@ import { test } from "node:test";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { Result } from "better-result";
-import { AgentConflictError, AgentProviderCancelledError } from "./local-agent-errors.js";
+import { AgentConflictError, AgentProviderCancelledError, AgentProviderExecutionError } from "./local-agent-errors.js";
 import { LocalAgentManager } from "./local-agent-manager.js";
 import { LocalAgentStore, type LocalAgentTurnRecord } from "./local-agent-store.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
@@ -17,8 +18,11 @@ import type { runWorkflowScript } from "./workflow-runner.js";
 import { WorkflowError } from "./workflow-types.js";
 import type { ServerConfig } from "./config.js";
 import { isManagedWorkflowWorkspace } from "./workflow-workspaces.js";
+import type { SubagentsConfig } from "./local-agent-config.js";
+import type { LocalAgentDriverKind } from "./local-agent-provider.js";
+import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
-async function fixture(runner?: typeof runWorkflowScript) {
+async function fixture(runner?: typeof runWorkflowScript, testing: { dsh?: boolean; dshCommand?: string; profiles?: LocalAgentProfile[]; response?: (input: LocalAgentRunInput) => string } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "devspace-workflow-"));
   await mkdir(join(dir, "project"));
   const root = await realpath(join(dir, "project"));
@@ -32,8 +36,8 @@ async function fixture(runner?: typeof runWorkflowScript) {
   let maximum = 0;
   let releaseHold: (() => void) | undefined;
 
-  const runtime: LocalAgentRuntime = {
-    provider: "codex", isAlive: () => true, close: async () => {}, releaseSession: async () => {},
+  const runtime = (provider: LocalAgentDriverKind): LocalAgentRuntime => ({
+    provider, isAlive: () => true, close: async () => {}, releaseSession: async () => {},
     run: async (input, callbacks) => {
       inputs.push(input);
       active++;
@@ -58,29 +62,36 @@ async function fixture(runner?: typeof runWorkflowScript) {
           });
 
           if (input.signal?.aborted) return Result.err(new AgentProviderCancelledError({
-            code: "PROVIDER_CANCELLED", provider: "codex", operation: "run", retryable: false, message: "Test provider confirmed cancellation.",
+            code: "PROVIDER_CANCELLED", provider, operation: "run", retryable: false, message: "Test provider confirmed cancellation.",
           }));
         }
 
         await new Promise((resolve) => setTimeout(resolve, 5));
 
-        return Result.ok({ provider: "codex" as const, providerSessionId: null, finalResponse: input.prompt.startsWith("Your last response") ? '{"ok":true}' : input.prompt, items: [] });
+        return Result.ok({ provider, providerSessionId: null, finalResponse: testing.response?.(input) ?? (input.prompt.startsWith("Your last response") ? '{"ok":true}' : input.prompt), items: [] });
       } finally { active--; }
     },
+  });
+
+  const subagents: SubagentsConfig = {
+    enabled: true, instructions: "on-demand", providers: [
+      { id: "codex", driver: "codex", enabled: true },
+      ...(testing.dsh ? [{ id: "dsh", driver: "dsh" as const, enabled: true, command: testing.dshCommand ?? process.execPath }] : []),
+    ],
   };
 
   const agents = new LocalAgentManager({
-    store: new LocalAgentStore(stateDir), pool: new LocalAgentRuntimePool(), loadProfiles: async () => [],
-    subagents: { enabled: true, instructions: "on-demand", providers: [{ id: "codex", driver: "codex", enabled: true }] },
-    drivers: [{
-      providerInstanceId: "codex", provider: "codex", runtimePolicy: { scope: "instance" },
+    store: new LocalAgentStore(stateDir), pool: new LocalAgentRuntimePool(), loadProfiles: async () => testing.profiles ?? [],
+    subagents,
+    drivers: subagents.providers.map(({ id, driver }) => ({
+      providerInstanceId: id, provider: driver, runtimePolicy: { scope: "instance" },
       capabilities: {
         sessions: { resume: true, close: false }, turns: { interrupt: true, streaming: false },
         configuration: { modelOverride: true, effortOverride: true },
         permissions: { enforcement: "native" }, mcp: { supported: false },
       },
-      createRuntime: async () => Result.ok(runtime),
-    }],
+      createRuntime: async () => Result.ok(runtime(driver)),
+    })),
     allowedRoots: [root],
     authorizeManagedWorkspace: (path, id) => isManagedWorkflowWorkspace(config, path, id),
   });
@@ -88,8 +99,8 @@ async function fixture(runner?: typeof runWorkflowScript) {
   const store = new WorkflowStore(stateDir);
 
   const workflows = new WorkflowManager({
-    store, agents, runner, config, loadProfiles: async () => [], allowedRoots: [root],
-    subagents: { enabled: true, instructions: "on-demand", providers: [{ id: "codex", driver: "codex", enabled: true }] },
+    store, agents, runner, config, loadProfiles: async () => testing.profiles ?? [], allowedRoots: [root],
+    subagents,
   });
 
   const scope = { workspaceRoot: root };
@@ -121,6 +132,102 @@ test("real JS pipeline runs in parallel, preserves order and durable turn owners
     assert.equal(events.value.turnId, first.turnId);
     assert.equal(events.value.events[0]?.type, "turn_started");
     assert.equal(events.value.events.at(-1)?.type, "turn_completed");
+  } finally { await f.close(); }
+});
+
+test("automatic testing routing records the selected Codex reviewer before dispatch", async () => {
+  const f = await fixture();
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, source: `export const meta={name:'routing'}; return await agent('review',{target:'auto',coordination:{kind:'analysis',uncertainty:'high'}});` });
+    const done = await f.workflows.wait(run.id, f.scope);
+    assert.equal(done.status, "completed", JSON.stringify(done.error));
+    assert.deepEqual(f.workflows.events(run.id, f.scope).find((event) => event.type === "routing_decision")?.data, {
+      index: 0, requestedTarget: "auto", target: "codex", reason: "high_uncertainty",
+    });
+    assert.equal(f.inputs.at(-1)?.prompt, "review");
+    assert.equal(f.workflows.calls(run.id, f.scope)[0]?.options.target, "codex");
+  } finally { await f.close(); }
+});
+
+test("a validated Codex plan reaches DSH before a Codex acceptance review in the same worktree", async () => {
+  const f = await fixture(undefined, { dsh: true, response: (input) => input.prompt.startsWith("plan")
+    ? JSON.stringify({ ready: true, cases: ["login-valid", "login-invalid"], evidence: ["src/auth.ts:10"] })
+    : input.prompt.startsWith("implement") ? "implemented login cases" : "reviewed" });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, writeMode: "allowed", source: `
+      const plan = await agent('plan', {
+        target:'auto', coordination:{kind:'analysis'}, writeMode:'read_only',
+        schema:{type:'object',properties:{ready:{type:'boolean'},cases:{type:'array',items:{type:'string'},minItems:1},evidence:{type:'array',items:{type:'string'},minItems:1}},required:['ready','cases','evidence'],additionalProperties:false}
+      });
+      if (!plan.ready) return {blocked:true};
+      const result = await agent('implement '+JSON.stringify(plan), {
+        target:'auto',coordination:{kind:'implementation',uncertainty:'low',scope:'test_and_fixtures'},
+        writeMode:'allowed',isolation:'worktree',workspace:'tests'
+      });
+      return await agent('review '+result, {target:'auto',coordination:{kind:'review'},writeMode:'read_only',workspace:'tests'});
+    ` });
+
+    const done = await f.workflows.wait(run.id, f.scope);
+    assert.equal(done.status, "completed", JSON.stringify(done.error));
+    const calls = f.workflows.calls(run.id, f.scope);
+    assert.deepEqual(calls.map((call) => call.options.target), ["codex", "dsh", "codex"]);
+    assert.deepEqual(calls.map((call) => call.options.writeMode), ["read_only", "allowed", "read_only"]);
+    assert.match(f.inputs[1]!.prompt, /login-valid.*login-invalid/);
+    assert.notEqual(calls[1]!.workspaceRoot, f.root);
+    assert.equal(calls[1]!.workspaceRoot, calls[2]!.workspaceRoot);
+    assert.equal(f.workflows.events(run.id, f.scope).filter((event) => event.type === "routing_decision").length, 3);
+    assert.equal(done.result, "reviewed");
+  } finally { await f.close(); }
+});
+
+test("a blocked analysis prevents downstream DSH dispatch", async () => {
+  const f = await fixture(undefined, { dsh: true, response: () => '{"ready":false}' });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, source: `
+      const plan = await agent('plan',{target:'auto',coordination:{kind:'analysis'},schema:{type:'object',properties:{ready:{type:'boolean'}},required:['ready']}});
+      if (!plan.ready) return {status:'blocked',nextOwner:'human'};
+      return await agent('implement',{target:'auto',coordination:{kind:'implementation',uncertainty:'low'}});
+    ` });
+
+    const done = await f.workflows.wait(run.id, f.scope);
+    assert.deepEqual(done.result, { status: "blocked", nextOwner: "human" });
+    assert.deepEqual(f.workflows.calls(run.id, f.scope).map((call) => call.options.target), ["codex"]);
+  } finally { await f.close(); }
+});
+
+test("automatic routing falls back before dispatch and read-only routing replays consistently", async () => {
+  const f = await fixture(undefined, { dsh: true, dshCommand: "/definitely/missing/devspace-dsh" });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, source: `return await agent('test',{target:'auto',coordination:{kind:'implementation',uncertainty:'low'}});` });
+    assert.equal((await f.workflows.wait(run.id, f.scope)).status, "completed");
+    assert.equal(f.workflows.calls(run.id, f.scope)[0]?.options.target, "codex");
+    assert.deepEqual(f.workflows.events(run.id, f.scope).find((event) => event.type === "routing_decision")?.data, {
+      index: 0, requestedTarget: "auto", target: "codex", reason: "dsh_unavailable", fallback: "dsh",
+    });
+    const resumed = await f.workflows.run({ ...f.scope, resume: run.id });
+    assert.equal((await f.workflows.wait(resumed.id, f.scope)).status, "completed");
+    assert.equal(f.inputs.length, 1);
+    assert.equal(f.workflows.calls(resumed.id, f.scope)[0]?.reusedFrom, run.id);
+  } finally { await f.close(); }
+});
+
+test("automatic provider selection rejects profile collisions while explicit profiles retain precedence", async () => {
+  const f = await fixture(undefined, { dsh: true, profiles: [{ name: "codex", provider: "dsh", description: "Explicit worker", body: "", filePath: "/unused", disabled: false }] });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, source: `return agent('review',{target:'auto',coordination:{kind:'analysis'}});` });
+    assert.equal((await f.workflows.wait(run.id, f.scope)).error?.code, "AMBIGUOUS_TARGET");
+    assert.equal(f.inputs.length, 0);
+    const explicit = await f.workflows.run({ ...f.scope, source: `return agent('review',{target:'codex',coordination:{kind:'analysis'}});` });
+    assert.equal((await f.workflows.wait(explicit.id, f.scope)).status, "completed");
+    const call = f.workflows.calls(explicit.id, f.scope)[0]!;
+    const record = f.agents.get(call.agentId, f.scope);
+    assert.ok(record.isOk());
+    assert.equal(record.value.providerInstanceId, "dsh");
   } finally { await f.close(); }
 });
 
@@ -406,3 +513,244 @@ function unwrap<T, E>(result: import("better-result").Result<T, E>): T {
 
   return result.value;
 }
+
+const testingResult = { status: "completed", artifacts: [], verification: [], evidence: ["Read actual files"], unresolved: [], nextOwner: "codex" };
+const testingPlan = { ...testingResult, uncertainty: "low", testPlan: "SC-1: empty input is invalid; SC-2: text input is valid", implementationTask: "Add assertions for both scenarios" };
+
+const testingContract = {
+  task: "Cover validation", allowedPaths: ["tests"], artifacts: ["tests/case.cjs"], acceptance: ["Assert both valid and invalid input"],
+  checks: [{ id: "unit", executable: process.execPath, args: ["-e", "require('./tests/case.cjs');require('node:fs').writeFileSync('tests/report.json',JSON.stringify({passed:2}))"], reports: ["tests/report.json"] }],
+};
+
+function testImplementation(input: LocalAgentRunInput, valid = true): string {
+  mkdirSync(join(input.workspaceRoot, "tests"), { recursive: true });
+  writeFileSync(join(input.workspaceRoot, "tests/case.cjs"), valid ? "const assert=require('node:assert/strict');assert.equal(''.trim().length>0,false);assert.equal(' x '.trim().length>0,true);" : "require('node:assert/strict').equal(1,2)");
+
+  return JSON.stringify({ ...testingResult, artifacts: ["tests/case.cjs"] });
+}
+
+test("builtin testing runs plan, DSH implementation, independent assertions and read-only Codex review on one baseline", async () => {
+  const f = await fixture(undefined, { dsh: true, response: (input) => input.prompt.startsWith("Analyze") ? JSON.stringify(testingPlan)
+    : input.prompt.startsWith("Implement") ? testImplementation(input) : JSON.stringify(testingResult) });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.status, "completed", JSON.stringify(final));
+    assert.equal(unsafeResult(final.result).status, "completed");
+    const calls = f.workflows.calls(run.id, f.scope);
+    assert.deepEqual(calls.map((call) => call.options.target), ["codex", "dsh", "codex"]);
+    assert.equal(new Set(calls.map((call) => call.workspaceRoot)).size, 1);
+    assert.notEqual(calls[0]!.workspaceRoot, f.root);
+    assert.deepEqual(calls.map((call) => call.options.writeMode), ["read_only", "allowed", "read_only"]);
+    const events = f.workflows.events(run.id, f.scope);
+    const evidence = events.find((event) => event.type === "testing_verification");
+    assert.ok(evidence);
+    const record = unsafeResult(evidence.data);
+    const verification = JSON.parse(await readFile(String(record.path), "utf8"));
+    assert.equal(verification.passed, true);
+    assert.equal(verification.exitCode, 0);
+    assert.ok(events.some((event) => event.type === "testing_acceptance"));
+    await assert.rejects(f.workflows.run({ ...f.scope, resume: run.id }), /never replayed/);
+  } finally { await f.close(); }
+});
+
+function unsafeResult(value: WireInput): Record<string, WireInput> {
+  // SAFETY: Test assertions inspect JSON objects produced by the workflow runtime.
+  return value as Record<string, WireInput>;
+}
+
+test("builtin blocks upstream ambiguity without starting DSH", async () => {
+  const f = await fixture(undefined, { dsh: true, response: () => JSON.stringify({ ...testingPlan, status: "blocked", unresolved: ["Missing expected behavior"], nextOwner: "human" }) });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.status, "completed");
+    assert.equal(unsafeResult(final.result).status, "blocked");
+    assert.equal(f.inputs.length, 1);
+  } finally { await f.close(); }
+});
+
+test("failed independent verification is diagnosed before bounded repair and rerun", async () => {
+  let implementations = 0;
+
+  const f = await fixture(undefined, { dsh: true, response: (input) => {
+    if (input.prompt.startsWith("Analyze")) return JSON.stringify(testingPlan);
+
+    if (input.prompt.startsWith("Implement")) return testImplementation(input, ++implementations > 1);
+
+    if (input.prompt.startsWith("Diagnose")) return JSON.stringify({ ...testingResult, repairable: true, instructions: "Fix the failing test assertion", uncertainty: "low", nextOwner: "dsh" });
+
+    return JSON.stringify(testingResult);
+  } });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(unsafeResult(final.result).status, "completed", JSON.stringify(final));
+    assert.equal(unsafeResult(final.result).repairCount, 1);
+    assert.deepEqual(f.workflows.calls(run.id, f.scope).map((call) => call.options.coordination?.kind), ["analysis", "implementation", "analysis", "implementation", "review"]);
+    const records = f.workflows.events(run.id, f.scope).filter((event) => event.type === "testing_verification");
+    assert.equal(records.length, 2);
+    const checks = await Promise.all(records.map(async (event) => JSON.parse(await readFile(String(unsafeResult(event.data).path), "utf8"))));
+    assert.deepEqual(checks.map((check) => check.passed), [false, true]);
+  } finally { await f.close(); }
+});
+
+test("two repairs cover the whole task and provider changes do not reset the budget", async () => {
+  const f = await fixture(undefined, { dsh: true, response: (input) => {
+    if (input.prompt.startsWith("Analyze")) return JSON.stringify(testingPlan);
+
+    if (input.prompt.startsWith("Implement")) return testImplementation(input, false);
+
+    return JSON.stringify({ ...testingResult, repairable: true, instructions: "Fix this assertion", uncertainty: "low", nextOwner: "codex" });
+  } });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(unsafeResult(final.result).status, "blocked", JSON.stringify(final));
+    assert.equal(unsafeResult(final.result).repairCount, 2);
+    const implementation = f.workflows.calls(run.id, f.scope).filter((call) => call.options.coordination?.kind === "implementation");
+    assert.deepEqual(implementation.map((call) => call.options.target), ["dsh", "codex", "codex"]);
+  } finally { await f.close(); }
+});
+
+test("builtin requires explicit committed baseline for dirty input and enforces the total call budget", async () => {
+  const f = await fixture(undefined, { dsh: true, response: (input) => input.prompt.startsWith("Analyze") ? JSON.stringify(testingPlan) : testImplementation(input) });
+
+  try {
+    await writeFile(join(f.root, "dirty.txt"), "preserve");
+    await assert.rejects(f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" }), /uncommitted inputs/);
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: { ...testingContract, baseRef: "HEAD", maxCalls: 1 }, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.status, "failed");
+    assert.equal(final.error?.code, "WORKFLOW_CALL_LIMIT");
+    assert.equal(f.inputs.length, 1);
+    assert.equal(await readFile(join(f.root, "dirty.txt"), "utf8"), "preserve");
+  } finally { await f.close(); }
+});
+
+test("Shadow uses independent worktrees and reports quality without changing configuration", async () => {
+  const f = await fixture(undefined, { dsh: true, response: (input) => input.prompt.startsWith("Analyze") ? JSON.stringify(testingPlan)
+    : input.prompt.startsWith("Implement") ? testImplementation(input) : JSON.stringify(testingResult) });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: { ...testingContract, mode: "shadow" }, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(unsafeResult(final.result).status, "completed", JSON.stringify(final));
+    const calls = f.workflows.calls(run.id, f.scope);
+    const workers = calls.filter((call) => call.options.coordination?.kind === "implementation");
+    assert.deepEqual(workers.map((call) => call.options.target), ["codex", "dsh"]);
+    assert.notEqual(workers[0]!.workspaceRoot, workers[1]!.workspaceRoot);
+    assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: workers[0]!.workspaceRoot, encoding: "utf8" }), execFileSync("git", ["rev-parse", "HEAD"], { cwd: workers[1]!.workspaceRoot, encoding: "utf8" }));
+    assert.match(String(unsafeResult(final.result).recommendation), /explicitly enabling/);
+  } finally { await f.close(); }
+});
+
+test("missing committed inputs block before any model dispatch", async () => {
+  const f = await fixture(undefined, { dsh: true });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: { ...testingContract, inputs: ["missing-spec.md"] }, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.status, "failed");
+    assert.match(final.error?.message ?? "", /missing-spec.md/);
+    assert.equal(f.inputs.length, 0);
+  } finally { await f.close(); }
+});
+
+test("JSON corrections consume the builtin call budget and use reduced authority", async () => {
+  const f = await fixture(undefined, { dsh: true, response: (input) => input.prompt.startsWith("Your last response") ? JSON.stringify(testingPlan) : "invalid-json" });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: { ...testingContract, maxCalls: 2 }, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.error?.code, "WORKFLOW_CALL_LIMIT");
+    assert.equal(f.inputs.length, 2);
+    assert.equal(f.inputs[1]?.writeMode, "read_only");
+  } finally { await f.close(); }
+});
+
+test("read-only planning or implementation scope escapes block acceptance and retain the worktree", async () => {
+  for (const phase of ["Analyze", "Implement"]) {
+    const f = await fixture(undefined, { dsh: true, response: (input) => {
+      if (input.prompt.startsWith(phase)) writeFileSync(join(input.workspaceRoot, "business.txt"), "unexpected mutation");
+
+      return JSON.stringify(input.prompt.startsWith("Analyze") ? testingPlan : testingResult);
+    } });
+
+    try {
+      const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+      const final = await f.workflows.wait(run.id, f.scope, 10_000);
+
+      if (phase === "Analyze") assert.equal(final.error?.code, "TESTING_SCOPE");
+      else assert.equal(unsafeResult(final.result).status, "blocked");
+      const worker = f.workflows.calls(run.id, f.scope).at(-1)!;
+      assert.equal(await readFile(join(worker.workspaceRoot, "business.txt"), "utf8"), "unexpected mutation");
+      assert.equal(f.workflows.events(run.id, f.scope).some((event) => event.type === "testing_acceptance"), false);
+    } finally { await f.close(); }
+  }
+});
+
+test("Codex diagnoses partial provider writes before taking over the same bounded task", async () => {
+  let implementations = 0;
+
+  const f = await fixture(undefined, { dsh: true, response: (input) => {
+    if (input.prompt.startsWith("Analyze")) return JSON.stringify(testingPlan);
+
+    if (input.prompt.startsWith("Implement")) {
+      if (++implementations === 1) {
+        mkdirSync(join(input.workspaceRoot, "tests"));
+        writeFileSync(join(input.workspaceRoot, "tests/partial.txt"), "retained partial write");
+        throw new AgentProviderExecutionError({ code: "PROVIDER_EXECUTION_ERROR", provider: "dsh", operation: "run", retryable: false, message: "provider disconnected after partial write" });
+      }
+
+      return testImplementation(input);
+    }
+
+    if (input.prompt.startsWith("Diagnose")) return JSON.stringify({ ...testingResult, repairable: true, instructions: "Complete the test; preserve the partial-write evidence", uncertainty: "low", nextOwner: "codex" });
+
+    return JSON.stringify(testingResult);
+  } });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.status, "completed", JSON.stringify({ final, calls: f.workflows.calls(run.id, f.scope).map((call) => ({phase:call.options.phase, status:call.status, error:call.error})) }));
+    assert.equal(unsafeResult(final.result).status, "completed", JSON.stringify(final));
+    const calls = f.workflows.calls(run.id, f.scope);
+    assert.deepEqual(calls.map((call) => call.options.target), ["codex", "dsh", "codex", "codex", "codex"]);
+    assert.equal(calls[1]?.status, "failed");
+    assert.equal(new Set(calls.map((call) => call.workspaceRoot)).size, 1);
+    assert.equal(await readFile(join(calls[1]!.workspaceRoot, "tests/partial.txt"), "utf8"), "retained partial write");
+  } finally { await f.close(); }
+});
+
+test("an elapsed absolute budget blocks dispatch even before timer callbacks run", async (t) => {
+  const f = await fixture(async (input) => {
+    t.mock.timers.tick(1001);
+
+    return input.onAgent("Late task", { target: "codex" });
+  });
+
+  try {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: { ...testingContract, timeoutMs: 1000 }, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.error?.code, "WORKFLOW_TIMEOUT");
+    assert.equal(f.inputs.length, 0);
+  } finally { t.mock.timers.reset(); await f.close(); }
+});
+
+test("unexpected execution-layer internal errors stop admission even when the guest catches them", async () => {
+  const f = await fixture(undefined, { response: () => { throw new Error("unexpected internal defect"); } });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, source: `try { await agent('first',{target:'codex'}); } catch {} return agent('must not start',{target:'codex'});` });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(final.error?.code, "AGENT_INTERNAL_ERROR");
+    assert.equal(f.inputs.length, 1);
+  } finally { await f.close(); }
+});

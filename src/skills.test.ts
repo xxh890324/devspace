@@ -91,6 +91,7 @@ test("the managed subagents skill replaces a stale user copy and workflows need 
   );
   // Workflows stay hidden unless the experimental environment flag is set.
   assert.equal(experimentalSkills.some((skill) => skill.name === "workflows"), false);
+  assert.equal(experimentalSkills.some((skill) => skill.name === "testing-coordination"), false);
   assert.equal(existsSync(join(devspaceSkills, "workflows")), false);
   process.env.DEVSPACE_EXPERIMENTAL_WORKFLOWS = "1";
 
@@ -106,6 +107,10 @@ test("the managed subagents skill replaces a stale user copy and workflows need 
       flagged.filter((skill) => skill.filePath.startsWith(join(devspaceSkills, "workflows"))).map((skill) => skill.name),
       ["workflows"],
     );
+    const coordination = flagged.find((skill) => skill.name === "testing-coordination");
+    assert.equal(coordination?.filePath, join(devspaceSkills, "testing-coordination", "SKILL.md"));
+    assert.ok(resolveSkillReadPath(flagged, join(devspaceSkills, "testing-coordination", "workflow.md")));
+    assert.equal(existsSync(join(devspaceSkills, "testing-coordination", "workflow.md")), true);
   } finally {
     delete process.env.DEVSPACE_EXPERIMENTAL_WORKFLOWS;
   }
@@ -115,6 +120,7 @@ test("the managed subagents skill replaces a stale user copy and workflows need 
     false,
     "a managed copy synced while the flag was on is not advertised once it is off",
   );
+  assert.equal(loadWorkspaceSkills(experimentalConfig, projectRoot).skills.some((skill) => skill.name === "testing-coordination"), false);
 });
 
 test("a configured path matching a default skill path is listed once", async (t) => {
