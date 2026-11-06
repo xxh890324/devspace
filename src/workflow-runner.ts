@@ -5,6 +5,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WorkflowError, type WorkflowAgentOptions } from "./workflow-types.js";
 import { parseWorkflowScript } from "./workflow-script.js";
+import { parseCoordinationTask } from "./testing-coordination.js";
 
 export type { JsonValue } from "./json-value.js";
 
@@ -28,6 +29,8 @@ export interface RunWorkflowScriptInput {
   /** Internal nesting marker. A nested runner must pass depth: 1. */
   depth?: number;
   onAgent(prompt: string, options: WorkflowAgentOptions): Promise<JsonValue> | JsonValue;
+  onInspect?(options: WireInput): Promise<JsonValue> | JsonValue;
+  onVerify?(options: WireInput): Promise<JsonValue> | JsonValue;
   onWorkflow?(name: string, args: WireInput): Promise<JsonValue> | JsonValue;
   onEvent?(type: string, data: WireInput): Promise<void> | void;
 }
@@ -59,9 +62,9 @@ const HARD_LIMITS: WorkflowRunnerLimits = {
 interface HostCallMessage {
   type: "host-call";
   id: number;
-  kind: "agent" | "workflow";
-  prompt?: WireInput;
+  kind: "agent" | "workflow" | "inspect" | "verify";
   options?: WireInput;
+  prompt?: WireInput;
   name?: WireInput;
   args?: WireInput;
 }
@@ -231,6 +234,11 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
             "Agent result",
             limits.maxResultBytes,
           );
+        } else if (message.kind === "inspect" || message.kind === "verify") {
+          const handler = message.kind === "inspect" ? input.onInspect : input.onVerify;
+
+          if (!handler) throw new WorkflowError("WORKFLOW_CAPABILITY_UNAVAILABLE", "Testing operations require a built-in testing contract.");
+          value = validateJson(await handler(message.options), "Testing evidence", limits.maxResultBytes);
         } else if (message.kind === "workflow") {
           if ((input.depth ?? 0) >= 1) {
             return sendHostError(child, message.id, new WorkflowError("WORKFLOW_NESTING_LIMIT", "Workflows may be nested at most one level."));
@@ -306,7 +314,7 @@ function validateAgentOptions(value: WireInput, maxBytes: number): WorkflowAgent
   const options = validateJson(value, "Agent options", maxBytes);
 
   if (!isRecord(options)) throw new WorkflowError("WORKFLOW_INVALID_AGENT_CALL", "agent options must be an object.");
-  const allowed = new Set(["target", "model", "effort", "schema", "label", "phase", "writeMode", "isolation", "workspace"]);
+  const allowed = new Set(["target", "model", "effort", "schema", "label", "phase", "writeMode", "isolation", "workspace", "coordination"]);
 
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) throw new WorkflowError("WORKFLOW_INVALID_AGENT_CALL", `Unknown agent option: ${key}`);
@@ -337,6 +345,15 @@ function validateAgentOptions(value: WireInput, maxBytes: number): WorkflowAgent
   if (options.workspace !== undefined
     && (!isJsonString(options.workspace) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(options.workspace))) {
     throw new WorkflowError("WORKFLOW_INVALID_AGENT_CALL", "agent options.workspace must be a logical key, not a path.");
+  }
+
+  if (options.coordination !== undefined) {
+    try {
+      const task = parseCoordinationTask(options.coordination);
+
+      if (options.target === "auto" && task.routing === "explicit") throw new Error("Explicit routing requires a concrete target.");
+    }
+    catch { throw new WorkflowError("WORKFLOW_INVALID_AGENT_CALL", "agent options.coordination is invalid."); }
   }
 
   return unsafeNarrow<WorkflowAgentOptions>(options);
@@ -432,6 +449,9 @@ function errorMessage(error: WireInput): string {
 }
 
 function isFatalCode(code: string): boolean {
+  // A provider protocol failure belongs to its call, not the workflow transport.
+  if (code.startsWith("PROVIDER_")) return false;
+
   return code.includes("LIMIT")
     || code.includes("INTERNAL")
     || code.includes("PROTOCOL")

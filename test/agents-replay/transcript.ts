@@ -1,7 +1,6 @@
-import { unsafeNarrow } from "../../src/unsafe-narrow.js";
 import { isJsonString, isObjectValue } from "../../src/json-value.js";
 import type { WireInput } from "../../src/json-value.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { redactSecrets } from "../../src/local-agent-events.js";
 
 /**
@@ -22,10 +21,11 @@ export interface TranscriptMeta {
   /** Output of `<command> --version`, replayed for drivers that probe it. */
   version?: string;
   recordedAt: string;
+  source?: string;
 }
 
 export interface TranscriptFrame {
-  dir: "in" | "out";
+  dir: "in" | "out" | "signal";
   /** Milliseconds since the provider process started. */
   ms: number;
   frame: unknown;
@@ -60,19 +60,39 @@ export interface ScrubContext {
 }
 
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const cachedPlaceholders = new WeakMap<ScrubContext, Array<[string, string]>>();
 
 function placeholders(context: ScrubContext): Array<[string, string]> {
-  return [
-    ...(context.worktree
-      // SAFETY: The surrounding checks or construction already match this type.
-      ? unsafeNarrow<Array<[string, string]>>([[context.worktree, "$WORKTREE"], [context.worktree.replace(/[/\\.:]/g, "-"), "$WORKTREE_SLUG"]])
-      : []),
-    [context.workspace, "$WORKSPACE"],
-    // Providers name per-project state directories after the cwd with separators dashed.
-    [context.workspace.replace(/[/\\.:]/g, "-"), "$CWD_SLUG"],
-    [context.tmp, "$TMP"],
-    [context.home, "$HOME"],
+  const cached = cachedPlaceholders.get(context);
+
+  if (cached) return cached;
+  const result: Array<[string, string]> = [];
+
+  const roots: Array<[string | undefined, string, string?]> = [
+    [context.worktree, "$WORKTREE", "$WORKTREE_SLUG"],
+    [context.workspace, "$WORKSPACE", "$CWD_SLUG"],
+    [context.tmp, "$TMP"], [context.home, "$HOME"],
   ];
+
+  for (const [path, placeholder, slug] of roots) {
+    if (!path) continue;
+    const spellings = new Set([path]);
+
+    // Node's cwd and native providers may expand Windows 8.3 names (or /var
+    // aliases) while the runner retains the configured spelling of that root.
+    try { spellings.add(realpathSync.native(path)); }
+    catch { /* Optional roots may not exist yet; retain their explicit spelling. */ }
+
+    for (const spelling of spellings) {
+      for (const variant of new Set([spelling, spelling.replaceAll("\\", "/")])) result.push([variant, placeholder]);
+
+      if (slug) result.push([spelling.replace(/[/\\.:]/g, "-"), slug]);
+    }
+  }
+
+  cachedPlaceholders.set(context, result);
+
+  return result;
 }
 
 export function scrub(value: WireInput, context: ScrubContext): WireInput {

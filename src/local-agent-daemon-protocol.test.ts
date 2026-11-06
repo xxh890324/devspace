@@ -185,3 +185,13 @@ test("error responses survive an encode and decode round trip", () => {
   assert.equal(response.ok, false);
   assert.deepEqual(!response.ok && response.error, error);
 });
+
+test("builtin testing inputs and durable metadata survive daemon decoding without affecting old records", () => {
+  const builtin = request("workflow.run", { workspaceRoot: "/project", builtin: "testing-coordination", args: { task: "test" }, writeMode: "allowed" });
+  assert.equal(builtin.method === "workflow.run" && builtin.params.builtin, "testing-coordination");
+  assert.throws(() => request("workflow.run", { workspaceRoot: "/project", builtin: "unknown" }), /Unknown built-in/);
+  assert.throws(() => request("workflow.run", { workspaceRoot: "/project", builtin: "testing-coordination", name: "other" }), /Exactly one/);
+  const previous = { id: "wf_test", workspaceRoot: "/project", name: "test", status: "completed", writeMode: "allowed", concurrency: 1, createdAt: "now", updatedAt: "now", callCount: 3 };
+  assert.equal(decodeWorkflowRun(previous).builtin, undefined);
+  assert.equal(decodeWorkflowRun({ ...previous, builtin: "testing-coordination", baseSha: "abc" }).baseSha, "abc");
+});

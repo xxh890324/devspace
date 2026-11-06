@@ -1,3 +1,4 @@
+import { parseCoordinationTask } from "./testing-coordination.js";
 import { isJsonString, isJsonNumber, isJsonBoolean, isObjectValue, optionalFields } from "./json-value.js";
 import type { WireInput, JsonObject } from "./json-value.js";
 import type {
@@ -516,6 +517,8 @@ export function decodeWorkflowRun(value: WireInput): WorkflowRun {
     writeMode,
     concurrency: requiredNonNegativeInteger(record?.concurrency, "concurrency"),
     resumeOf: optionalString(record?.resumeOf),
+    ...optionalFields(record?.builtin === "testing-coordination" ? { builtin: "testing-coordination" as const } : undefined),
+    ...optionalFields(record?.baseSha === undefined ? undefined : { baseSha: requiredString(record.baseSha, "baseSha") }),
     ...optionalFields(record && "result" in record ? { result: record.result } : undefined),
     ...optionalFields(record?.error === undefined ? undefined : { error: decodeWorkflowFailure(record.error) }),
     createdAt: requiredString(record?.createdAt, "createdAt"),
@@ -553,6 +556,7 @@ export function decodeWorkflowCall(value: WireInput): WorkflowCall {
     ...optionalFields(isWorkflowWriteMode(options.writeMode) ? { writeMode: options.writeMode } : undefined),
     ...optionalFields(options.isolation === "worktree" ? { isolation: "worktree" } : undefined),
     workspace: optionalString(options.workspace),
+    ...optionalFields(options.coordination === undefined ? undefined : { coordination: parseCoordinationTask(options.coordination) }),
   };
 
   return {
@@ -753,9 +757,12 @@ function decodeWorkflowRunInput(value: WireInput): WorkflowRunInput {
   const source = optionalContentString(record.source);
   const name = optionalString(record.name);
   const resume = optionalString(record.resume);
+  const builtin = optionalString(record.builtin);
 
-  if ([source, name, resume].filter((entry) => entry !== undefined).length !== 1) {
-    throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "Exactly one workflow source, name, or resume id is required.");
+  if (builtin !== undefined && builtin !== "testing-coordination") throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "Unknown built-in workflow.");
+
+  if ([source, name, builtin, resume].filter((entry) => entry !== undefined).length !== 1) {
+    throw new LocalAgentDaemonProtocolError("INVALID_PARAMS", "Exactly one workflow source, name, builtin, or resume id is required.");
   }
 
   const writeMode = record.writeMode;
@@ -769,6 +776,7 @@ function decodeWorkflowRunInput(value: WireInput): WorkflowRunInput {
     ...optionalFields(source === undefined ? undefined : { source }),
     ...optionalFields(name === undefined ? undefined : { name }),
     ...optionalFields(resume === undefined ? undefined : { resume }),
+    ...optionalFields(builtin === undefined ? undefined : { builtin }),
     ...optionalFields(record.args === undefined ? undefined : { args: record.args }),
     ...optionalFields(writeMode === undefined ? undefined : { writeMode }),
   };

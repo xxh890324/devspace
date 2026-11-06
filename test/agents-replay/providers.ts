@@ -132,6 +132,27 @@ const CODEX_USER_ENVIRONMENT_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 export const PROVIDERS = {
+  dsh: {
+    id: "dsh",
+    redactFrame: (frame: JsonObject) => {
+      // DSH also reports complete model context, local skill catalogs and request schemas.
+      // The adapter consumes only these activity events, so omit unrelated user environment.
+      if (frame.method === "session.event") {
+        const params = isJsonObject(frame.params) ? frame.params : undefined;
+        const event = params && isJsonObject(params.event) ? params.event : undefined;
+
+        if (!event || !["assistant/message", "tool/call", "tool/result", "turn/end"].includes(String(event.type))) return undefined;
+      }
+
+      return frame;
+    },
+    protocol: { ...jsonRpc, volatileKeys: new Set([...jsonRpc.volatileKeys, "messageId", "callId", "commandId", "createdAt", "updatedAt"]) },
+    realCommand: () => process.env.DEVSPACE_QA_DSH_COMMAND ?? "dsh",
+    liveEnv: () => ({
+      ...optionalFields(process.env.DEVSPACE_QA_DSH_HOME ? { DSH_HOME: process.env.DEVSPACE_QA_DSH_HOME } : undefined),
+      DSH_TELEMETRY_DISABLED: "1",
+    }),
+  },
   claude: {
     id: "claude",
     model: "haiku",

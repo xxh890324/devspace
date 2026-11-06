@@ -164,3 +164,16 @@ SSE, so the current transcripts contain no stream frames.
   is the `app-server --help` support probe and `<scenario>.2.jsonl` is the
   app-server session. `redactFrame` drops notifications about the user's
   hooks, MCP servers, account, and config, which the driver ignores.
+
+### DSH SDK recordings
+
+DSH is included in the default offline replay suite. Its transcripts were recorded from the actual DSH `0.2.2-rc.1` SDK against a deterministic loopback Messages API, not a paid model. Each transcript records this provenance. Context snapshots, local skill catalogs and request headers are omitted; paths and secret-shaped strings are scrubbed. Signal frames preserve the point at which a provider process was killed, so shutdown output cannot be replayed before cancellation.
+
+To repeat the real-SDK local-API validation, use an already installed compatible isolated runtime:
+
+```sh
+DEVSPACE_QA_DSH_COMMAND=/absolute/path/to/dsh pnpm exec tsx test/agents-replay/dsh-local-api.ts --record
+pnpm qa:agents dsh
+```
+
+The harness creates its own DSH_HOME/profile and DevSpace state, uses a fixture-only API key and loopback server, and retains its summary. It does not upgrade the system DSH, copy credentials or make model API calls. Run/continue, native read-only mode, stop/no-late-write, events, worktree isolation and missing command all use the ordinary CLI → daemon → adapter path. A replay cannot prove platform sandbox enforcement or model quality; the recording run checks actual fixture file effects separately.

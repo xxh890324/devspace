@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,10 @@ import { findGitRoot } from "./cli-workspace.js";
 
 /** The standalone skill is the managed `subagents` skill under a name that cannot clash with an agent's own subagents. */
 const STANDALONE_NAME = "devspace-agents";
+
+export type BundledAgentSkill = "subagents" | "testing-coordination";
+
+const skillName = (skill: BundledAgentSkill) => skill === "subagents" ? STANDALONE_NAME : "devspace-testing-coordination";
 
 export const AGENT_SKILL_INSTALL_TARGETS = ["claude-code", "codex", "cursor", "opencode", "agents"] as const;
 
@@ -16,8 +20,8 @@ interface SkillSource {
   body: string;
 }
 
-function bundledSkill(): SkillSource {
-  return parseSkillSource(readFileSync(fileURLToPath(new URL("../skills/subagents/SKILL.md", import.meta.url)), "utf8"));
+function bundledSkill(skill: BundledAgentSkill): SkillSource {
+  return parseSkillSource(readFileSync(fileURLToPath(new URL(`../skills/${skill}/SKILL.md`, import.meta.url)), "utf8"));
 }
 
 /** Accepts CRLF: git's autocrlf checks the file out that way on Windows. */
@@ -31,18 +35,22 @@ export function parseSkillSource(source: string): SkillSource {
 }
 
 /** `skill` is a SKILL.md for agents with Agent Skills; `cursor-rule` is a Cursor `.mdc` rule. */
-export function renderAgentsSkill(format: "skill" | "cursor-rule" = "skill"): string {
-  const { description, body } = bundledSkill();
+export function renderAgentsSkill(format: "skill" | "cursor-rule" = "skill", skill: BundledAgentSkill = "subagents"): string {
+  const { description, body } = bundledSkill(skill);
 
   const frontmatter = format === "skill"
-    ? `name: ${STANDALONE_NAME}\ndescription: ${description}`
+    ? `name: ${skillName(skill)}\ndescription: ${description}`
     : `description: ${description}\nalwaysApply: false`;
 
-  return `---\n${frontmatter}\n---\n${body}`;
+  const renderedBody = format === "cursor-rule" && skill === "testing-coordination"
+    ? body.replaceAll("](workflow.md)", "](devspace-testing-coordination/workflow.md)") : body;
+
+  return `---\n${frontmatter}\n---\n${renderedBody}`;
 }
 
 export interface AgentSkillInstallOptions {
   project: boolean;
+  skill?: BundledAgentSkill;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   home?: string;
@@ -51,10 +59,10 @@ export interface AgentSkillInstallOptions {
 /** Install the standalone skill where `target` discovers it; returns the file written. */
 export function installAgentsSkill(
   target: AgentSkillInstallTarget,
-  { project, cwd = process.cwd(), env = process.env, home = homedir() }: AgentSkillInstallOptions,
+  { project, skill = "subagents", cwd = process.cwd(), env = process.env, home = homedir() }: AgentSkillInstallOptions,
 ): string {
   const projectRoot = findGitRoot(cwd) ?? cwd;
-  const skillFile = (base: string) => join(base, STANDALONE_NAME, "SKILL.md");
+  const skillFile = (base: string) => join(base, skillName(skill), "SKILL.md");
   let path: string;
 
   switch (target) {
@@ -79,14 +87,26 @@ export function installAgentsSkill(
       // Cursor user rules live in its settings UI, not in a file, so rules are project-only.
       if (!project) throw new Error("Cursor rules are per project. Run from the project and add --project.");
       mkdirSync(join(projectRoot, ".cursor", "rules"), { recursive: true });
-      path = join(projectRoot, ".cursor", "rules", `${STANDALONE_NAME}.mdc`);
-      writeFileSync(path, renderAgentsSkill("cursor-rule"));
+      path = join(projectRoot, ".cursor", "rules", `${skillName(skill)}.mdc`);
+      writeFileSync(path, renderAgentsSkill("cursor-rule", skill));
+
+      if (skill === "testing-coordination") copyTestingResources(join(dirname(path), skillName(skill)));
 
       return path;
   }
 
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, renderAgentsSkill("skill"));
+  writeFileSync(path, renderAgentsSkill("skill", skill));
+
+  if (skill === "testing-coordination") copyTestingResources(dirname(path));
 
   return path;
+}
+
+function copyTestingResources(directory: string): void {
+  mkdirSync(directory, { recursive: true });
+
+  for (const resource of ["workflow.md", "workflow.js"]) {
+    copyFileSync(fileURLToPath(new URL(`../skills/testing-coordination/${resource}`, import.meta.url)), join(directory, resource));
+  }
 }

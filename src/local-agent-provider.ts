@@ -3,6 +3,7 @@ export const LOCAL_AGENT_DRIVER_KINDS = [
   "claude",
   "opencode",
   "pi",
+  "dsh",
   "acp",
 ] as const;
 

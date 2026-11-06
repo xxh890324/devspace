@@ -77,3 +77,7 @@ jobs:
       - name: Subagent conformance replay
         if: matrix.os == 'ubuntu-latest'
         run: pnpm qa:agents
+
+      - name: DSH conformance replay on remaining platforms
+        if: matrix.os != 'ubuntu-latest'
+        run: pnpm qa:agents dsh

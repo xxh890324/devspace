@@ -74,6 +74,7 @@ function testPackedPackageLaunchers(): void {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
+      CODEX_HOME: join(home, ".codex"),
       DEVSPACE_CONFIG_DIR: join(root, "fresh-config"),
       DEVSPACE_OAUTH_OWNER_TOKEN: "",
     };
@@ -91,6 +92,14 @@ function testPackedPackageLaunchers(): void {
     );
     execInstalledBin(installRoot, "devspace", ["agents", "skill", "--install", "claude-code"], freshEnv);
     assert.ok(existsSync(join(home, ".claude", "skills", "devspace-agents", "SKILL.md")));
+    execInstalledBin(installRoot, "devspace", ["agents", "skill", "--skill", "testing-coordination", "--install", "codex"], freshEnv);
+    const skill = join(home, ".codex", "skills", "devspace-testing-coordination");
+    assert.ok(existsSync(join(skill, "SKILL.md")));
+    assert.ok(existsSync(join(skill, "workflow.md")));
+    assert.ok(existsSync(join(skill, "workflow.js")));
+    execFileSync(process.execPath, [join(projectRoot, "test/fixtures/package-testing.mjs"), join(installRoot, "node_modules/@waishnav/devspace"), join(root, "offline")], {
+      env: { ...process.env, ...env }, encoding: "utf8", stdio: "pipe", timeout: 60_000,
+    });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

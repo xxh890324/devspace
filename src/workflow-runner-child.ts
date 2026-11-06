@@ -153,7 +153,7 @@ function exposeHostFunctions(vm: QuickJSContext): void {
 
       const kind = vm.getString(kindHandle);
 
-      if (kind !== "agent" && kind !== "workflow") throw new Error("Unknown workflow host call.");
+      if (kind !== "agent" && kind !== "workflow" && kind !== "inspect" && kind !== "verify") throw new Error("Unknown workflow host call.");
       const encoded = encodeGuestJson(vm, payloadHandle, "Workflow host call");
 
       if (Buffer.byteLength(encoded, "utf8") > limits.maxArgsBytes) {
@@ -174,7 +174,8 @@ function exposeHostFunctions(vm: QuickJSContext): void {
       const safePayload = JSON.parse(encoded) as JsonObject;
       send(kind === "agent"
         ? { type: "host-call", id, kind, prompt: safePayload.prompt, options: safePayload.options }
-        : { type: "host-call", id, kind, name: safePayload.name, args: safePayload.args });
+        : kind === "workflow" ? { type: "host-call", id, kind, name: safePayload.name, args: safePayload.args }
+        : { type: "host-call", id, kind, options: safePayload.options });
 
       return deferred.handle;
     } catch (error) {
@@ -264,12 +265,14 @@ const __error = error => ({
   message: typeof error?.message === "string" ? error.message : String(error),
   retryable: error?.retryable === true,
 });
-const { agent, workflow, log, phase, parallel, pipeline } = (() => {
+const { agent, workflow, log, phase, parallel, pipeline, inspect, verify } = (() => {
 const hostCall = globalThis.__hostCall;
 const emit = globalThis.__emit;
 delete globalThis.__hostCall;
 delete globalThis.__emit;
 const agent = (prompt, options = {}) => hostCall("agent", { prompt, options });
+const inspect = (options) => hostCall("inspect", { options });
+const verify = (options) => hostCall("verify", { options });
 const workflow = (name, workflowArgs = null) => hostCall("workflow", { name, args: workflowArgs });
 const log = (...values) => emit("log", values.length === 1 ? values[0] : values);
 const phase = async (name, run) => {
@@ -310,7 +313,7 @@ const pipeline = (items, ...stages) => {
     return value;
   }, ${concurrency});
 };
-return Object.freeze({ agent, workflow, log, phase, parallel, pipeline });
+return Object.freeze({ agent, workflow, log, phase, parallel, pipeline, inspect, verify });
 })();
 globalThis.__workflowResult = (async () => {
 ${message.source}
@@ -450,6 +453,8 @@ function fail(error: ErrorPayload, fatal = false): void {
 }
 
 function isFatal(code: string): boolean {
+  if (code.startsWith("PROVIDER_")) return false;
+
   return code.includes("LIMIT")
     || code.includes("INTERNAL")
     || code.includes("PROTOCOL")

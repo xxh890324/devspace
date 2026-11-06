@@ -118,6 +118,7 @@ export async function runWorkflowCommand(args: string[], json: boolean): Promise
 async function parseWorkflowRunArgs(args: string[]): Promise<Omit<WorkflowRunInput, "workspaceRoot" | "workspaceId">> {
   let file: string | undefined;
   let name: string | undefined;
+  let builtin: WorkflowRunInput["builtin"];
   let resume: string | undefined;
   let rawArgs: string | undefined;
   let argsFile: string | undefined;
@@ -127,11 +128,14 @@ async function parseWorkflowRunArgs(args: string[]): Promise<Omit<WorkflowRunInp
     const option = args[index]!;
     const value = args[index + 1];
 
-    if (!value) usage("run --file <path>|--name <name>|--resume <id>");
+    if (!value) usage("run --file <path>|--name <name>|--builtin testing-coordination|--resume <id>");
 
     switch (option) {
       case "--file": file = value; break;
       case "--name": name = value; break;
+      case "--builtin":
+        if (value !== "testing-coordination") throw new Error("Unknown built-in workflow.");
+        builtin = value; break;
       case "--resume": resume = value; break;
       case "--args": rawArgs = value; break;
       case "--args-file": argsFile = value; break;
@@ -145,8 +149,8 @@ async function parseWorkflowRunArgs(args: string[]): Promise<Omit<WorkflowRunInp
     index += 1;
   }
 
-  if ([file, name, resume].filter(Boolean).length !== 1) {
-    throw new Error("Exactly one of --file, --name, or --resume is required.");
+  if ([file, name, builtin, resume].filter(Boolean).length !== 1) {
+    throw new Error("Exactly one of --file, --name, --builtin, or --resume is required.");
   }
 
   if (rawArgs !== undefined && argsFile !== undefined) {
@@ -156,6 +160,7 @@ async function parseWorkflowRunArgs(args: string[]): Promise<Omit<WorkflowRunInp
   const input: Omit<WorkflowRunInput, "workspaceRoot" | "workspaceId"> = {
     ...optionalFields(file ? { source: await readBoundedFile(file, 64 * 1024, "Workflow source") } : undefined),
     ...optionalFields(name ? { name } : undefined),
+    ...optionalFields(builtin ? { builtin } : undefined),
     ...optionalFields(resume ? { resume } : undefined),
     ...optionalFields(writeMode ? { writeMode } : undefined),
   };
@@ -340,7 +345,7 @@ export function printWorkflowHelp(): void {
     "DevSpace workflow",
     "",
     "Usage:",
-    "  devspace workflow run --file <path>|--name <name>|--resume <id> [--args <json>|--args-file <file>] [--write-mode read_only|allowed] [--json]",
+    "  devspace workflow run --file <path>|--name <name>|--builtin testing-coordination|--resume <id> [--args <json>|--args-file <file>] [--write-mode read_only|allowed] [--json]",
     "  devspace workflow status <id> [--json]",
     "  devspace workflow wait <id> [--timeout <seconds>] [--json]",
     "  devspace workflow calls <id> [--json]",

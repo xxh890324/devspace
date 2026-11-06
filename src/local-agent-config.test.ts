@@ -137,6 +137,13 @@ test("a named provider instance keeps its declared driver", () => {
   assert.equal(subagentProviderConfig(namedInstance, "codex-work")?.driver, "codex");
 });
 
+test("DSH provider accepts an SDK profile and rejects ACP-only options", () => {
+  const dsh = parseSubagentsConfig({ enabled: true, providers: [{ id: "dsh", driver: "dsh", enabled: true, config: { profile: "sdk" }, model: "deepseek-v4-pro" }] });
+  assert.equal(dsh.providers[0]?.driver, "dsh");
+  assert.equal(dsh.providers[0]?.config?.profile, "sdk");
+  assert.throws(() => parseSubagentsConfig({ enabled: true, providers: [{ id: "dsh", driver: "dsh", enabled: true, config: { args: ["--profile", "sdk"] } }] }), /does not support ACP args/);
+});
+
 test("a generic ACP provider keeps its custom args", () => {
   const genericAcp = parseSubagentsConfig({
     enabled: true,

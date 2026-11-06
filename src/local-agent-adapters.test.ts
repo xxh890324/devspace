@@ -66,6 +66,17 @@ test("a Claude session variable set in the provider config env is kept", () => {
   assert.equal(env.CLAUDECODE, undefined);
 });
 
+test("the independent DSH SDK adapter is registered as a native provider", () => {
+  const [driver] = createLocalAgentDrivers({
+    env: { PATH: "/usr/local/bin" },
+    subagents: { enabled: true, instructions: "on-demand", providers: [{ id: "dsh", driver: "dsh", enabled: true, config: { profile: "sdk" } }] },
+  });
+
+  assert.equal(driver?.provider, "dsh");
+  assert.equal(driver?.capabilities.permissions.enforcement, "native");
+  assert.equal(driver?.capabilities.sessions.resume, true);
+});
+
 test("the OpenCode final response is the last assistant text or structured output", () => {
   assert.equal(
     extractOpenCodeFinalResponse({

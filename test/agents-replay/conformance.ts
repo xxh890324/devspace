@@ -240,7 +240,7 @@ async function main(): Promise<void> {
 }
 
 async function runScenario(provider: ProviderDefinition, scenario: Scenario, mode: Mode): Promise<void> {
-  const root = realpathSync(await mkdtemp(join(tmpdir(), "devspace-agents-qa-")));
+  const root = realpathSync.native(await mkdtemp(join(tmpdir(), "devspace-agents-qa-")));
   const workspace = join(root, "repo");
   const configDir = join(root, "config");
   const runDir = join(root, "run");
@@ -266,6 +266,7 @@ async function runScenario(provider: ProviderDefinition, scenario: Scenario, mod
       enabled: true,
       providers: [{
         id: provider.id,
+        ...optionalFields(provider.id === "dsh" ? { driver: "dsh" } : undefined),
         enabled: true,
         ...optionalFields(provider.model ? { model: provider.model } : undefined),
         ...optionalFields(command ? { command } : undefined),
@@ -327,6 +328,16 @@ function writeShimWrapper(
   };
 
   const tsx = import.meta.resolve("tsx");
+
+  if (process.platform === "win32") {
+    const batchValue = (value: string) => value.replaceAll("%", "%%");
+    const path = join(root, "bin", `${provider.id}-shim.cmd`);
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(path, ["@echo off", ...Object.entries(variables).map(([key, value]) => `set "${key}=${batchValue(value)}"`),
+      `"${batchValue(process.execPath)}" --import "${batchValue(tsx)}" "${batchValue(shimPath)}" %*`, ""].join("\r\n"));
+
+    return path;
+  }
 
   const lines = [
     "#!/bin/sh",
@@ -418,7 +429,7 @@ function exec(run: Run, args: string[]): Promise<CliResult> {
 }
 
 function streams(provider: ProviderDefinition): boolean {
-  const driver = createLocalAgentDrivers().find((entry) => entry.providerInstanceId === provider.id);
+  const driver = (provider.id === "dsh" ? createLocalAgentDrivers({ subagents: { enabled: true, instructions: "on-demand", providers: [{ id: "dsh", driver: "dsh", enabled: true }] } }) : createLocalAgentDrivers()).find((entry) => entry.providerInstanceId === provider.id);
 
   return driver?.capabilities.turns.streaming === true;
 }

@@ -56,3 +56,19 @@ test("the skill installs to each target's global and project locations", (t) => 
     join(root, "codex/skills/devspace-agents/SKILL.md"),
   );
 });
+
+test("testing skill installation is explicit and includes resolvable resources for each target", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-testing-skill-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const target of ["codex", "agents", "claude-code", "opencode", "cursor"] as const) {
+    const path = installAgentsSkill(target, { project: true, cwd: root, skill: "testing-coordination" });
+    assert.match(readFileSync(path, "utf8"), /--builtin testing-coordination/);
+
+    for (const resource of ["workflow.md", "workflow.js"]) {
+      assert.equal(readFileSync(join(path, "..", target === "cursor" ? "devspace-testing-coordination" : ".", resource), "utf8"), readFileSync(new URL(`../skills/testing-coordination/${resource}`, import.meta.url), "utf8"));
+    }
+  }
+
+  assert.match(renderAgentsSkill(), /name: devspace-agents/);
+});

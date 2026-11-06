@@ -212,6 +212,7 @@
                   "claude",
                   "opencode",
                   "pi",
+                  "dsh",
                   "acp",
                   "cursor",
                   "copilot",
@@ -260,6 +261,10 @@
                       "copilot",
                       "grok"
                     ]
+                  },
+                  "profile": {
+                    "type": "string",
+                    "minLength": 1
                   }
                 },
                 "additionalProperties": false

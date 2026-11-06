@@ -33,6 +33,7 @@ const commandSchema = z.string()
 const acpConfigSchema = z.object({
   args: z.array(z.string()).optional(),
   flavor: z.enum(LEGACY_ACP_DRIVER_KINDS).optional(),
+  profile: z.string().trim().min(1).optional(),
 }).strict();
 
 const inputDriverKinds = [...LOCAL_AGENT_DRIVER_KINDS, ...LEGACY_ACP_DRIVER_KINDS] as const;
@@ -58,13 +59,19 @@ const providerSchema = z.object({
     return;
   }
 
-  if (driver !== "acp" && provider.config !== undefined) {
+  if (driver !== "acp" && driver !== "dsh" && provider.config !== undefined) {
     context.addIssue({
       code: "custom",
       path: ["config"],
       message: `${driver} does not support ACP config.`,
     });
   }
+
+  if (driver === "dsh" && provider.config?.args !== undefined) context.addIssue({ code: "custom", path: ["config", "args"], message: "dsh does not support ACP args." });
+
+  if (driver === "dsh" && provider.config?.flavor !== undefined) context.addIssue({ code: "custom", path: ["config", "flavor"], message: "dsh does not support ACP flavor." });
+
+  if (driver !== "dsh" && provider.config?.profile !== undefined) context.addIssue({ code: "custom", path: ["config", "profile"], message: `${driver} does not support DSH profile.` });
 
   const flavor = provider.config?.flavor
     ?? (provider.driver && isLegacyAcpDriverKind(provider.driver) ? provider.driver : undefined)
@@ -225,6 +232,8 @@ export function providerCommandVariable(driver: LocalAgentDriverKind): string | 
     case "opencode": return "OPENCODE_COMMAND";
     case "acp":
       return undefined;
+    case "dsh":
+      return "DSH_COMMAND";
   }
 }
 

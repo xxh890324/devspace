@@ -46,6 +46,8 @@ return { reviews, summary };
 | `parallel(items, worker, concurrency?)` | Calls `worker(item, index)` for every item, at most `concurrency` at a time (default `meta.concurrency`, maximum 16). Never rejects: resolves to one `{ status: "completed", value }` or `{ status: "failed", error: { code, message, retryable } }` per item, in input order. |
 | `pipeline(items, ...stages)` | Passes each item through the stages in order, calling `stage(value, item, index)` where `value` is the previous stage's result. Items run concurrently like `parallel` and resolve to the same per-item outcomes. |
 | `workflow(name, args?)` | Runs another named workflow from `.devspace/workflows/` and resolves to its result. |
+| `inspect({workspace, artifacts?})` | Builtin testing contract only: create/reuse its isolated worktree and return a baseline-relative manifest, hashes, excerpts and scope violations. |
+| `verify({workspace, checkId})` | Builtin testing contract with allowed authority only: execute a host-declared executable/argv check, recording bounded output, cancellation, reports and current file evidence. Cannot supply replacement commands. |
 | `log(...values)` | Records JSON-compatible progress in the run's event log. |
 | `args` | The frozen JSON arguments passed with `--args` or `--args-file`; `{}` when none were passed. |
 
@@ -58,20 +60,41 @@ const summaries = results.filter((r) => r.status === "completed").map((r) => r.v
 const failures = results.filter((r) => r.status === "failed").map((r) => r.error.message);
 ```
 
+`inspect` and `verify` are denied for ordinary file/named workflows: only the whitelisted
+`--builtin testing-coordination` source receives a parsed, immutable host contract. Run it with
+`--args-file <contract.json> --write-mode allowed`; builtin, file, name and resume selections are mutually exclusive.
+See [testing contract and evidence](../testing-coordination/workflow.md). No new MCP tool is exposed.
+
 ## `agent` options
 
 | Option | Meaning |
 | --- | --- |
-| `target` | **Required.** A provider or profile name from `devspace agents targets`. |
+| `target` | **Required.** A provider or profile name from `devspace agents targets`, or `"auto"` with `coordination` below. |
 | `model`, `effort` | Override the target's model or reasoning effort. |
 | `label` | Short name shown in `devspace workflow calls`. |
 | `schema` | JSON Schema for a structured response (see below). |
 | `writeMode` | `"read_only"` or `"allowed"`. Defaults to the run's authority and can never exceed it. |
 | `isolation` | `"worktree"`: run this call in its own Git worktree created from committed `HEAD`. |
 | `workspace` | A logical name (letters, digits, `_`, `-`; at most 64) for a worktree that later calls in this run reuse. Never a path. The first call that uses a name must also pass `isolation: "worktree"` to create it; later calls pass only `workspace`. |
+| `coordination` | Host-authored testing metadata: `kind` (`analysis`, `implementation`, `review`, `verification`), `uncertainty` (`low`, `medium`, `high`; default `medium`), `scope` (`tests_only`, `test_and_fixtures`, `business_code`; default `tests_only`), `routing` (`explicit`, `shadow`, `enabled`; default `enabled`). |
 
 Any other option is rejected. Each prompt should be self-contained: a subagent sees only its prompt and the
 project, not the rest of the workflow.
+
+With `target: "auto"`, only low uncertainty test implementation in `enabled` routing selects an enabled DSH
+instance with an executable command. Other work stays on an enabled Codex instance. `explicit` routing requires a
+concrete target; `shadow` keeps execution on Codex. Each automatic selection emits `routing_decision`, retaining
+the requested target, selected target, reason, and fallback suggestion. Calls persist the selected target.
+Concrete targets always take precedence. Automatic routing chooses provider instances, not role profiles; pass a
+profile explicitly when its instructions matter. Configure provider-specific models on providers or profiles.
+If a profile shadows an automatically selected provider name, the call fails with `AMBIGUOUS_TARGET`; select that
+profile explicitly or give the provider a distinct instance id.
+
+Executable preflight does not verify SDK compatibility or credentials. If DSH fails during execution, the call
+fails and the host or workflow must decide recovery after inspecting any edits. No writing call is retried on
+another provider automatically. `scope` is routing metadata, not a filesystem allowlist: validate the resulting
+diff before accepting it. For a plan → implementation → review example with blocked handoffs, read the
+`testing-coordination` skill and its `workflow.md` reference.
 
 ### Structured responses
 

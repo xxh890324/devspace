@@ -1148,14 +1148,20 @@ function parseAgentsWaitArgs(args: string[]): AgentsWaitArgs {
 }
 
 function runAgentsSkill(args: string[]): void {
-  const usage = `Usage: devspace agents skill [--install <${AGENT_SKILL_INSTALL_TARGETS.join("|")}> [--project]]`;
+  const usage = `Usage: devspace agents skill [--install <${AGENT_SKILL_INSTALL_TARGETS.join("|")}> [--project]] [--skill <subagents|testing-coordination>]`;
   let target: string | undefined;
   let project = false;
+  let skill: "subagents" | "testing-coordination" = "subagents";
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!;
 
-    if (argument === "--project") project = true;
+    if (argument === "--skill") {
+      const value = args[++index];
+
+      if (value !== "subagents" && value !== "testing-coordination") throw new Error(usage);
+      skill = value;
+    } else if (argument === "--project") project = true;
     else if (argument === "--install") target = args[++index];
     else if (argument.startsWith("--install=")) target = argument.slice("--install=".length);
     else throw new Error(usage);
@@ -1163,7 +1169,7 @@ function runAgentsSkill(args: string[]): void {
 
   if (target === undefined) {
     if (project) throw new Error(usage);
-    process.stdout.write(renderAgentsSkill());
+    process.stdout.write(renderAgentsSkill("skill", skill));
 
     return;
   }
@@ -1171,7 +1177,7 @@ function runAgentsSkill(args: string[]): void {
   const installTarget = AGENT_SKILL_INSTALL_TARGETS.find((candidate) => candidate === target);
 
   if (!installTarget) throw new Error(usage);
-  console.log(`Installed ${installAgentsSkill(installTarget, { project })}`);
+  console.log(`Installed ${installAgentsSkill(installTarget, { project, skill })}`);
 }
 
 async function runAgentsDaemon(args: string[], json: boolean): Promise<void> {
