@@ -240,7 +240,7 @@ async function main(): Promise<void> {
 }
 
 async function runScenario(provider: ProviderDefinition, scenario: Scenario, mode: Mode): Promise<void> {
-  const root = realpathSync(await mkdtemp(join(tmpdir(), "devspace-agents-qa-")));
+  const root = realpathSync.native(await mkdtemp(join(tmpdir(), "devspace-agents-qa-")));
   const workspace = join(root, "repo");
   const configDir = join(root, "config");
   const runDir = join(root, "run");

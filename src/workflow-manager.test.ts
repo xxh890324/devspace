@@ -572,6 +572,50 @@ test("builtin blocks upstream ambiguity without starting DSH", async () => {
   } finally { await f.close(); }
 });
 
+test("malformed testing output preserves bounded redacted evidence for Codex diagnosis", async () => {
+  const token = "x".repeat(60);
+  const malformed = (stage: string) => `${stage}: Authorization: Bearer ${token}\n${".".repeat(5000)}`;
+
+  const f = await fixture(undefined, { dsh: true, response: (input) => {
+    if (input.prompt.startsWith("Analyze")) return JSON.stringify(testingPlan);
+
+    if (input.prompt.startsWith("Implement")) {
+      assert.match(input.prompt, /without Markdown code fences/);
+      testImplementation(input);
+
+      return malformed("INITIAL_BAD_OUTPUT");
+    }
+
+    if (input.prompt.startsWith("Your last response")) {
+      assert.match(input.prompt, /without Markdown code fences/);
+
+      return malformed("CORRECTED_BAD_OUTPUT");
+    }
+
+    assert.ok(input.prompt.startsWith("Diagnose"));
+    assert.match(input.prompt, /CORRECTED_BAD_OUTPUT/);
+    assert.match(input.prompt, /remainingCalls/);
+    assert.equal(input.prompt.includes(token), false);
+
+    return JSON.stringify({ ...testingResult, status: "blocked", repairable: false, instructions: "", uncertainty: "high", unresolved: ["Host must inspect the invalid output"], nextOwner: "human" });
+  } });
+
+  try {
+    const run = await f.workflows.run({ ...f.scope, builtin: "testing-coordination", args: testingContract, writeMode: "allowed" });
+    const final = await f.workflows.wait(run.id, f.scope, 10_000);
+    assert.equal(unsafeResult(final.result).status, "blocked");
+    const events = f.workflows.events(run.id, f.scope).filter((event) => event.type === "testing_invalid_output");
+    assert.equal(events.length, 2);
+    assert.deepEqual(events.map((event) => unsafeResult(event.data).stage), ["initial", "correction"]);
+    assert.ok(events.every((event) => unsafeResult(event.data).responseTruncated === true));
+    assert.ok(events.every((event) => String(unsafeResult(event.data).response).length <= 2048));
+    assert.equal(JSON.stringify(events).includes(token), false);
+    assert.deepEqual(f.inputs.map((input) => input.writeMode), ["read_only", "allowed", "read_only", "read_only"]);
+    assert.equal(f.workflows.calls(run.id, f.scope).filter((call) => call.options.coordination?.kind === "implementation").length, 1);
+    assert.ok(!f.workflows.events(run.id, f.scope).some((event) => event.type === "testing_acceptance"));
+  } finally { await f.close(); }
+});
+
 test("failed independent verification is diagnosed before bounded repair and rerun", async () => {
   let implementations = 0;
 

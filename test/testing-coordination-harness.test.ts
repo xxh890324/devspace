@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import type { JsonValue, WireInput } from "../src/json-value.js";
 import { ensureLocalAgentDaemonSecret, LOCAL_AGENT_DAEMON_PROTOCOL_VERSION, localAgentDaemonPaths } from "../src/local-agent-daemon-lifecycle.js";
 import { decodeLocalAgentDaemonRequest, encodeLocalAgentDaemonResponse } from "../src/local-agent-daemon-protocol.js";
 import { writeTestDevspaceConfig } from "../src/test-support/config.js";
+import { restore, scrub } from "./agents-replay/transcript.js";
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), "ds-budget-"));
@@ -106,6 +107,21 @@ test("a non-file ledger is not treated as an absent ledger", async (t) => {
   const { root, ledger } = await fixture(t);
   await mkdir(ledger);
   await assert.rejects(reserveLiveBudget(ledger, root), /regular file/);
+});
+
+test("replay recognizes native canonical paths while restoring the configured workspace spelling", async (t) => {
+  const { root } = await fixture(t);
+  const workspace = join(root, "project");
+  const alias = join(root, "alias");
+  await mkdir(workspace);
+  await symlink(workspace, alias, process.platform === "win32" ? "junction" : "dir");
+  const context = { workspace: alias, home: root, tmp: tmpdir() };
+  const canonical = await realpath(alias);
+  assert.equal(scrub(canonical, context), "$WORKSPACE");
+  assert.equal(scrub(alias, context), "$WORKSPACE");
+  assert.equal(scrub(canonical.replaceAll("\\", "/"), context), "$WORKSPACE");
+  assert.equal(restore("$WORKSPACE", context), alias);
+  assert.notEqual(scrub(join(root, "unrelated"), context), "$WORKSPACE");
 });
 
 test("interruption or missing turn evidence keeps reservation across restart", async (t) => {
